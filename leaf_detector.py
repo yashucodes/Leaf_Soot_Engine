@@ -24,7 +24,56 @@ gray = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
 print("Image successfully loaded, resized, and converted to grayscale!")
 
 # ==========================================
-# 2. THE UPGRADED COLOR MASKING LOOP (HSV)
+# 2. GRABCUT FOREGROUND EXTRACTION (NEW)
+# ==========================================
+# Goal: isolate ONLY the leaf from the background, so that anything
+# outside the leaf's silhouette (other leaves, soil, blur, dark gaps)
+# never gets a chance to be counted as soot.
+
+print("✂️  Running GrabCut to isolate the leaf from the background...")
+
+# GrabCut needs an initial rectangle that roughly contains the foreground object.
+# We use a margin inset from the edges, assuming the leaf is roughly centered
+# and fills most of the frame (true for most close-up leaf photos).
+h, w = resized_image.shape[:2]
+margin_x, margin_y = int(w * 0.04), int(h * 0.04)
+grabcut_rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+
+# Mask that GrabCut will fill in with foreground/background labels
+gc_mask = np.zeros((h, w), dtype=np.uint8)
+
+# Internal models GrabCut uses while iterating (required by the function, not used after)
+bgd_model = np.zeros((1, 65), dtype=np.float64)
+fgd_model = np.zeros((1, 65), dtype=np.float64)
+
+cv2.grabCut(
+    resized_image,
+    gc_mask,
+    grabcut_rect,
+    bgd_model,
+    fgd_model,
+    5,                      # number of iterations; 5 is a good speed/accuracy tradeoff
+    cv2.GC_INIT_WITH_RECT
+)
+
+# GrabCut labels pixels as: 0=bg, 1=fg, 2=probable bg, 3=probable fg
+# We treat both "fg" and "probable fg" as part of the leaf.
+leaf_foreground_mask = np.where(
+    (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+    255,
+    0
+).astype(np.uint8)
+
+# Clean up small holes/noise in the foreground mask with morphological closing
+kernel = np.ones((7, 7), np.uint8)
+leaf_foreground_mask = cv2.morphologyEx(leaf_foreground_mask, cv2.MORPH_CLOSE, kernel)
+leaf_foreground_mask = cv2.morphologyEx(leaf_foreground_mask, cv2.MORPH_OPEN, kernel)
+
+leaf_pixel_count = cv2.countNonZero(leaf_foreground_mask)
+print(f"✂️  Leaf silhouette isolated: {leaf_pixel_count} pixels identified as leaf area.")
+
+# ==========================================
+# 3. THE UPGRADED COLOR MASKING LOOP (HSV)
 # ==========================================
 
 print("🔬 Running HSV color spectrum analysis...")
@@ -42,16 +91,25 @@ healthy_green_mask = cv2.inRange(hsv_image, lower_green, upper_green)
 
 # 4. The Magic Trick: Flip the mask! (Invert it)
 # If a pixel is NOT healthy green, we flag it as dust/pollution
-soot_mask = cv2.bitwise_not(healthy_green_mask)
+soot_mask_raw = cv2.bitwise_not(healthy_green_mask)
+
+# 5. NEW: Constrain the soot mask to ONLY the leaf area found by GrabCut.
+# This is the actual fix -- bitwise_and forces every pixel outside the
+# leaf silhouette to 0 (black), no matter what color it was.
+soot_mask = cv2.bitwise_and(soot_mask_raw, soot_mask_raw, mask=leaf_foreground_mask)
 
 # (Optional Texture Variance for the report)
 laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
 
-# 5. Count how many pixels are flagged as pollution
+# 6. Count how many pixels are flagged as pollution
 soot_pixels = cv2.countNonZero(soot_mask)
-total_leaf_pixels = gray.shape[0] * gray.shape[1]
 
-# 6. Math time: Find out what percentage of the image is covered in pollution
+# 7. IMPORTANT: total area is now the LEAF area, not the whole 800x800 frame.
+# Otherwise the percentage is artificially diluted by background pixels
+# that were never part of the leaf to begin with.
+total_leaf_pixels = leaf_pixel_count if leaf_pixel_count > 0 else (gray.shape[0] * gray.shape[1])
+
+# 8. Math time: Find out what percentage of the LEAF is covered in pollution
 soot_saturation_ratio = soot_pixels / total_leaf_pixels
 soot_saturation_percentage = soot_saturation_ratio * 100
 
@@ -61,7 +119,7 @@ print(f"📊 Pollution Saturation Detected: {soot_saturation_percentage:.2f}%")
 
 
 
-# 3. THE BOTANICAL ESTIMATION LOGIC
+# 4. THE BOTANICAL ESTIMATION LOGIC
 print("Calculating environmental impact...")
 
 # Environmental constants (our baseline science numbers)
@@ -81,7 +139,7 @@ print("Botanical impact formulas successfully calculated!")
 
 
 
-# 4.REPORT GENERATION
+# 5. REPORT GENERATION
 # Determine the status based on the remaining efficiency
 if estimated_efficiency > 80:
     status = "HEALTHY (Optimal Inhalation)"
@@ -96,7 +154,8 @@ print(" Analysis Engine: Laplacian Surface Texture Variance V1.0")
 print("-----------------------------------------------------------------")
 print("IMAGE PROCESSING METRICS:")
 print(f" Surface Texture Variance : {laplacian_var:.2f}")
-print(f" Calculated Soot Coverage  : {soot_saturation_percentage:.2f}% of total surface area")
+print(f" Leaf Area Isolated (GrabCut): {leaf_pixel_count} px")
+print(f" Calculated Soot Coverage  : {soot_saturation_percentage:.2f}% of LEAF surface area")
 print("")
 print("CLIMATE DEGRADATION IMPACT:")
 print(f" Stomatal Suffocation Index: {status}")
@@ -115,9 +174,11 @@ print("=================================================================\n")
 #VISUALIZING THE DETECTIVE WORK
 print("Opening visual display windows... Press any key to close them.")
 
-# Show the original image and the black-and-white Soot Mask side-by-side
+# Show the original image, the GrabCut leaf silhouette, and the final
+# background-suppressed Soot Mask side-by-side
 cv2.imshow("Original Leaf Image", resized_image)
-cv2.imshow("Soot Detection Map (White = Soot)", soot_mask)
+cv2.imshow("GrabCut Leaf Silhouette (White = Leaf)", leaf_foreground_mask)
+cv2.imshow("Soot Detection Map (White = Soot, Background Suppressed)", soot_mask)
 
 # Keep the windows open until you press any key on your keyboard
 cv2.waitKey(0)

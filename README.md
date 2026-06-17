@@ -33,5 +33,5 @@ By utilizing **GrabCut foreground extraction** alongside **HSV color-space inver
 
 1. **Clone the repository to your local machine:**
    ```bash
-   git clone [https://github.com/YOUR_USERNAME/leaf-pollution-analyzer.git](https://github.com/YOUR_USERNAME/leaf-pollution-analyzer.git)
-   cd leaf-pollution-analyzer
+   git clone [https://github.com/YOUR_USERNAME/Leaf_soot_Engine.git](https://github.com/YOUR_USERNAME/Leaf_Soot_Engine.git)
+   cd Lafe_Soot_Engine

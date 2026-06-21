@@ -1,185 +1,373 @@
 import cv2
 import numpy as np
-import tkinter as tk                  # Built-in tool to make pop-up windows
-from tkinter import filedialog        # Specifically for choosing files
+import tkinter as tk
+from tkinter import filedialog
+import os
 
-# 1. IMAGE PRE-PROCESSING
-print("Please choose a leaf image.")
-root = tk.Tk() # Hiding the main blank window that tkinter makes
+# =====================================================
+# IMAGE SELECTION
+# =====================================================
+
+print("Select a leaf image")
+
+root = tk.Tk()
 root.withdraw()
 
-image_path = filedialog.askopenfilename( # opening file explorer for user to select an image
-    title="Select Urban Leaf Image",
+image_path = filedialog.askopenfilename(
+    title="Select Leaf Image",
     filetypes=[("Image Files", "*.jpg *.jpeg *.png *.bmp")]
 )
+
 if not image_path:
-    print("Error: No file was selected. Exiting engine.")
+    print("No image selected")
     exit()
 
-print(f"Selected file: {image_path}")
-print("Loading urban leaf sample...")
 image = cv2.imread(image_path)
-resized_image = cv2.resize(image, (800, 800)) # Resize the image to 800x800 pixels so the math remains uniform
-gray = cv2.cvtColor(resized_image, cv2.COLOR_BGR2GRAY)
-print("Image successfully loaded, resized, and converted to grayscale!")
 
-# ==========================================
-# 2. GRABCUT FOREGROUND EXTRACTION (NEW)
-# ==========================================
-# Goal: isolate ONLY the leaf from the background, so that anything
-# outside the leaf's silhouette (other leaves, soil, blur, dark gaps)
-# never gets a chance to be counted as soot.
+if image is None:
+    print("Could not load image")
+    exit()
 
-print("✂️  Running GrabCut to isolate the leaf from the background...")
+# Resize for consistency
+height, width = image.shape[:2]
 
-# GrabCut needs an initial rectangle that roughly contains the foreground object.
-# We use a margin inset from the edges, assuming the leaf is roughly centered
-# and fills most of the frame (true for most close-up leaf photos).
-h, w = resized_image.shape[:2]
-margin_x, margin_y = int(w * 0.04), int(h * 0.04)
-grabcut_rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
+max_dim = 900
 
-# Mask that GrabCut will fill in with foreground/background labels
-gc_mask = np.zeros((h, w), dtype=np.uint8)
+if max(height, width) > max_dim:
+    scale = max_dim / max(height, width)
 
-# Internal models GrabCut uses while iterating (required by the function, not used after)
-bgd_model = np.zeros((1, 65), dtype=np.float64)
-fgd_model = np.zeros((1, 65), dtype=np.float64)
+    image = cv2.resize(
+        image,
+        (
+            int(width * scale),
+            int(height * scale)
+        )
+    )
+
+# =====================================================
+# ROI SELECTION
+# =====================================================
+
+print("\nDraw a box around the leaf.")
+print("Press ENTER when done.")
+
+roi = cv2.selectROI(
+    "Select Leaf",
+    image,
+    showCrosshair=True,
+    fromCenter=False
+)
+
+cv2.destroyWindow("Select Leaf")
+
+x, y, w, h = roi
+
+if w == 0 or h == 0:
+    print("No leaf selected")
+    exit()
+
+# =====================================================
+# GRABCUT
+# =====================================================
+
+print("Running GrabCut...")
+
+mask = np.zeros(image.shape[:2], np.uint8)
+
+bgdModel = np.zeros((1, 65), np.float64)
+fgdModel = np.zeros((1, 65), np.float64)
 
 cv2.grabCut(
-    resized_image,
-    gc_mask,
-    grabcut_rect,
-    bgd_model,
-    fgd_model,
-    5,                      # number of iterations; 5 is a good speed/accuracy tradeoff
+    image,
+    mask,
+    (x, y, w, h),
+    bgdModel,
+    fgdModel,
+    8,
     cv2.GC_INIT_WITH_RECT
 )
 
-# GrabCut labels pixels as: 0=bg, 1=fg, 2=probable bg, 3=probable fg
-# We treat both "fg" and "probable fg" as part of the leaf.
-leaf_foreground_mask = np.where(
-    (gc_mask == cv2.GC_FGD) | (gc_mask == cv2.GC_PR_FGD),
+leaf_mask = np.where(
+    (mask == cv2.GC_FGD) |
+    (mask == cv2.GC_PR_FGD),
     255,
     0
 ).astype(np.uint8)
 
-# Clean up small holes/noise in the foreground mask with morphological closing
-kernel = np.ones((7, 7), np.uint8)
-leaf_foreground_mask = cv2.morphologyEx(leaf_foreground_mask, cv2.MORPH_CLOSE, kernel)
-leaf_foreground_mask = cv2.morphologyEx(leaf_foreground_mask, cv2.MORPH_OPEN, kernel)
+# =====================================================
+# MASK CLEANUP
+# =====================================================
 
-leaf_pixel_count = cv2.countNonZero(leaf_foreground_mask)
-print(f"✂️  Leaf silhouette isolated: {leaf_pixel_count} pixels identified as leaf area.")
+kernel = np.ones((5, 5), np.uint8)
 
-# ==========================================
-# 3. THE UPGRADED COLOR MASKING LOOP (HSV)
-# ==========================================
+leaf_mask = cv2.morphologyEx(
+    leaf_mask,
+    cv2.MORPH_CLOSE,
+    kernel,
+    iterations=2
+)
 
-print("🔬 Running HSV color spectrum analysis...")
+leaf_mask = cv2.morphologyEx(
+    leaf_mask,
+    cv2.MORPH_OPEN,
+    kernel,
+    iterations=1
+)
 
-# 1. Convert the image to HSV (Hue, Saturation, Value) to ignore shadows
-hsv_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2HSV)
+# =====================================================
+# FIND TARGET CONTOUR
+# =====================================================
 
-# 2. Define the color range for "Healthy Green"
-# These numbers tell the computer exactly what shades of green to look for
-lower_green = np.array([35, 40, 40])
-upper_green = np.array([90, 255, 255])
+contours, _ = cv2.findContours(
+    leaf_mask,
+    cv2.RETR_EXTERNAL,
+    cv2.CHAIN_APPROX_SIMPLE
+)
 
-# 3. Create a mask that ONLY highlights the healthy green parts of the leaf
-healthy_green_mask = cv2.inRange(hsv_image, lower_green, upper_green)
+print(f"Contours found: {len(contours)}")
 
-# 4. The Magic Trick: Flip the mask! (Invert it)
-# If a pixel is NOT healthy green, we flag it as dust/pollution
-soot_mask_raw = cv2.bitwise_not(healthy_green_mask)
+# If GrabCut fails, fall back to ROI rectangle
+if len(contours) == 0:
 
-# 5. NEW: Constrain the soot mask to ONLY the leaf area found by GrabCut.
-# This is the actual fix -- bitwise_and forces every pixel outside the
-# leaf silhouette to 0 (black), no matter what color it was.
-soot_mask = cv2.bitwise_and(soot_mask_raw, soot_mask_raw, mask=leaf_foreground_mask)
+    print("GrabCut contour extraction failed.")
+    print("Falling back to ROI mask.")
 
-# (Optional Texture Variance for the report)
-laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+    leaf_mask = np.zeros(image.shape[:2], dtype=np.uint8)
 
-# 6. Count how many pixels are flagged as pollution
+    cv2.rectangle(
+        leaf_mask,
+        (x, y),
+        (x + w, y + h),
+        255,
+        -1
+    )
+
+    contours, _ = cv2.findContours(
+        leaf_mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+if not contours:
+    print("No contour found")
+    exit()
+
+roi_center_x = x + w // 2
+roi_center_y = y + h // 2
+
+best_contour = None
+best_distance = float("inf")
+
+for contour in contours:
+
+    area = cv2.contourArea(contour)
+
+    if area < 500:
+        continue
+
+    M = cv2.moments(contour)
+
+    if M["m00"] == 0:
+        continue
+
+    cx = int(M["m10"] / M["m00"])
+    cy = int(M["m01"] / M["m00"])
+
+    distance = (
+        (cx - roi_center_x) ** 2 +
+        (cy - roi_center_y) ** 2
+    )
+
+    if distance < best_distance:
+        best_distance = distance
+        best_contour = contour
+
+if best_contour is None:
+    print("Leaf could not be isolated")
+    exit()
+
+clean_mask = np.zeros_like(leaf_mask)
+
+cv2.drawContours(
+    clean_mask,
+    [best_contour],
+    -1,
+    255,
+    cv2.FILLED
+)
+
+leaf_mask = clean_mask
+
+# =====================================================
+# EXTRACT LEAF
+# =====================================================
+
+isolated_leaf = cv2.bitwise_and(
+    image,
+    image,
+    mask=leaf_mask
+)
+
+leaf_pixels = cv2.countNonZero(leaf_mask)
+
+# =====================================================
+# HSV ANALYSIS - HEALTHY GREEN DETECTOR
+# =====================================================
+
+print("Analyzing soot coverage...")
+
+hsv = cv2.cvtColor(isolated_leaf, cv2.COLOR_BGR2HSV)
+
+# Healthy leaf colors
+lower_green = np.array([25, 30, 30])
+upper_green = np.array([95, 255, 255])
+
+healthy_mask = cv2.inRange(
+    hsv,
+    lower_green,
+    upper_green
+)
+
+# Restrict to leaf area only
+healthy_mask = cv2.bitwise_and(
+    healthy_mask,
+    healthy_mask,
+    mask=leaf_mask
+)
+
+kernel_small = np.ones((3, 3), np.uint8)
+
+healthy_mask = cv2.morphologyEx(
+    healthy_mask,
+    cv2.MORPH_OPEN,
+    kernel_small
+)
+
+healthy_mask = cv2.morphologyEx(
+    healthy_mask,
+    cv2.MORPH_CLOSE,
+    kernel_small
+)
+
+# Everything NOT healthy green = soot
+soot_mask = cv2.bitwise_and(
+    leaf_mask,
+    cv2.bitwise_not(healthy_mask)
+)
+
+soot_mask = cv2.morphologyEx(
+    soot_mask,
+    cv2.MORPH_OPEN,
+    kernel_small
+)
+
+soot_mask = cv2.morphologyEx(
+    soot_mask,
+    cv2.MORPH_CLOSE,
+    kernel_small
+)
+
+# =====================================================
+# CALCULATE SOOT %
+# =====================================================
+
 soot_pixels = cv2.countNonZero(soot_mask)
 
-# 7. IMPORTANT: total area is now the LEAF area, not the whole 800x800 frame.
-# Otherwise the percentage is artificially diluted by background pixels
-# that were never part of the leaf to begin with.
-total_leaf_pixels = leaf_pixel_count if leaf_pixel_count > 0 else (gray.shape[0] * gray.shape[1])
+soot_percentage = (
+    soot_pixels / leaf_pixels * 100
+    if leaf_pixels > 0
+    else 0
+)
 
-# 8. Math time: Find out what percentage of the LEAF is covered in pollution
-soot_saturation_ratio = soot_pixels / total_leaf_pixels
-soot_saturation_percentage = soot_saturation_ratio * 100
+# =====================================================
+# TEXTURE ANALYSIS
+# =====================================================
 
-print(f"📊 Texture Variance Score: {laplacian_var:.2f}")
-print(f"📊 Pollution Saturation Detected: {soot_saturation_percentage:.2f}%")
+gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
+laplacian_var = cv2.Laplacian(
+    gray,
+    cv2.CV_64F
+).var()
 
+# =====================================================
+# ENVIRONMENT MODEL
+# =====================================================
 
+STOMATAL_FACTOR = 1.75
+BASE_CO2 = 22.0
 
-# 4. THE BOTANICAL ESTIMATION LOGIC
-print("Calculating environmental impact...")
+efficiency_drop = min(
+    soot_percentage * STOMATAL_FACTOR,
+    100
+)
 
-# Environmental constants (our baseline science numbers)
-STOMATAL_DENSITY_FACTOR = 1.75 # How aggressively soot blocks this tree's breathing pores
-HEALTHY_BASELINE_EFFICIENCY = 100.0 # A perfectly clean tree operates at 100%
-BASE_CARBON_ABSORPTION = 22.0 # A healthy mature tree absorbs about 22 kg of CO2 per year
+estimated_efficiency = 100 - efficiency_drop
 
-efficiency_drop = soot_saturation_percentage * STOMATAL_DENSITY_FACTOR # % drop in carbon inhalation efficiency
-if efficiency_drop > 100.0: # a tree can't lose more than 100% of its breathing ability, so we cap it at 100%
-    efficiency_drop = 100.0
-estimated_efficiency = HEALTHY_BASELINE_EFFICIENCY - efficiency_drop # remaining carbon inhalation efficiency
-net_lost_carbon = (efficiency_drop / 100.0) * BASE_CARBON_ABSORPTION # net kilograms of CO2 lost per tree per year
+lost_carbon = (
+    efficiency_drop / 100
+) * BASE_CO2
 
-print("Botanical impact formulas successfully calculated!")
+# =====================================================
+# STATUS
+# =====================================================
 
-
-
-
-
-# 5. REPORT GENERATION
-# Determine the status based on the remaining efficiency
 if estimated_efficiency > 80:
-    status = "HEALTHY (Optimal Inhalation)"
+    status = "HEALTHY"
 elif estimated_efficiency > 50:
-    status = "WARNING (Moderate Suffocation)"
+    status = "WARNING"
 else:
-    status = "CRITICAL (Severe Suffocation)"
+    status = "CRITICAL"
 
-#ASCII Dashboard Report
-print("================= CANOPY SOOT SATURATION REPORT =================")
-print(" Analysis Engine: Laplacian Surface Texture Variance V1.0")
-print("-----------------------------------------------------------------")
-print("IMAGE PROCESSING METRICS:")
-print(f" Surface Texture Variance : {laplacian_var:.2f}")
-print(f" Leaf Area Isolated (GrabCut): {leaf_pixel_count} px")
-print(f" Calculated Soot Coverage  : {soot_saturation_percentage:.2f}% of LEAF surface area")
-print("")
-print("CLIMATE DEGRADATION IMPACT:")
-print(f" Stomatal Suffocation Index: {status}")
-print(f" Estimated CO2 Inhalation  : {estimated_efficiency:.1f}% of baseline potential")
-print(f" Net Lost Carbon Capacity  : -{net_lost_carbon:.2f} kg CO2 / tree / year")
-print("")
-print("MANAGEMENT ACTION ADVISORY:")
-if estimated_efficiency < 70:
-    print(" Urban canopy in this sector is choked. Recommend immediate")
-    print(" automated water-mist spraying to wash leaves and restore capacity.")
-else:
-    print("Canopy is functioning well. Continue routine monitoring.")
-print("=================================================================\n")
+# =====================================================
+# OVERLAY
+# =====================================================
 
+overlay = image.copy()
 
-#VISUALIZING THE DETECTIVE WORK
-print("Opening visual display windows... Press any key to close them.")
+overlay[soot_mask > 0] = [0, 0, 255]
 
-# Show the original image, the GrabCut leaf silhouette, and the final
-# background-suppressed Soot Mask side-by-side
-cv2.imshow("Original Leaf Image", resized_image)
-cv2.imshow("GrabCut Leaf Silhouette (White = Leaf)", leaf_foreground_mask)
-cv2.imshow("Soot Detection Map (White = Soot, Background Suppressed)", soot_mask)
+# =====================================================
+# SAVE RESULTS
+# =====================================================
 
-# Keep the windows open until you press any key on your keyboard
+os.makedirs("results", exist_ok=True)
+
+cv2.imwrite(
+    "results/leaf_mask.png",
+    leaf_mask
+)
+
+cv2.imwrite(
+    "results/soot_mask.png",
+    soot_mask
+)
+
+cv2.imwrite(
+    "results/overlay.png",
+    overlay
+)
+
+# =====================================================
+# REPORT
+# =====================================================
+
+print("\n========== LEAF SOOT REPORT ==========")
+print(f"Leaf Area              : {leaf_pixels}")
+print(f"Soot Coverage          : {soot_percentage:.2f}%")
+print(f"Texture Variance       : {laplacian_var:.2f}")
+print(f"Tree Efficiency        : {estimated_efficiency:.2f}%")
+print(f"Lost Carbon Capacity   : {lost_carbon:.2f} kg/year")
+print(f"Status                 : {status}")
+print("======================================")
+
+# =====================================================
+# DISPLAY
+# =====================================================
+
+cv2.imshow("Original", image)
+cv2.imshow("Leaf Mask", leaf_mask)
+cv2.imshow("Soot Mask", soot_mask)
+cv2.imshow("Overlay", overlay)
+
 cv2.waitKey(0)
 cv2.destroyAllWindows()
